@@ -1,91 +1,89 @@
-# Based on: https://github.com/cohere-ai/cohere-toolkit/blob/main/standalone.Dockerfile
-
-FROM buildpack-deps:buster as builder
-LABEL authors="rashadphz"
-
-
-ENV PYTHON_VERSION=3.11.8
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONIOENCODING=utf-8
-ENV LANG C.UTF-8
-ENV PYTHONPATH=/workspace/src/
-
-ENV VIRTUAL_ENV=/workspace/.venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-ENV POETRY_VIRTUALENVS_IN_PROJECT=true
-
-RUN apt-get autoclean
-
-# Install python
-RUN cd /usr/src \
-    && wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz \
-    && tar -xzf Python-$PYTHON_VERSION.tgz \
-    && cd Python-$PYTHON_VERSION \
-    && ./configure --enable-optimizations \
-    && make install \
-    && ldconfig \
-    && rm -rf /usr/src/Python-$PYTHON_VERSION.tgz /usr/src/Python-$PYTHON_VERSION \
-    && update-alternatives --install /usr/bin/python python /usr/local/bin/python3 1
-
-# Install Poetry
-RUN pip3 install --no-cache-dir poetry
-
-WORKDIR /workspace
-
-# Copy dependency files to avoid cache invalidations
-COPY pyproject.toml poetry.lock ./
-
-# Install dependencies
-RUN poetry install
-
-# Copy the rest of the code
-COPY src/backend src/backend
-
-
-# Install nodejs
-RUN curl -sL https://deb.nodesource.com/setup_18.x | bash - \
-    && apt-get install -y nodejs \
-    && npm install -g pnpm \
-    # pm2 to start frontend
-    && npm install -g pm2
-
-
-WORKDIR /workspace/src/frontend
-COPY src/frontend/package.json src/frontend/pnpm-lock.yaml ./
-
-RUN pnpm install
-
-COPY src/frontend/ .
-
-RUN pnpm build
-
-# SearxNG installation
-WORKDIR /workspace/searxng
-
-# Install searxng dependencies
-RUN apt-get install -y \
-    python3-dev python3-babel python3-venv \
-    uwsgi uwsgi-plugin-python3 \
-    git build-essential libxslt-dev zlib1g-dev libffi-dev libssl-dev
-
-RUN git clone https://github.com/searxng/searxng.git .
-
-RUN pip3 install -U pip setuptools wheel pyyaml
-
-RUN pip3 install .
-
-COPY /searxng/uwsgi.ini /workspace/searxng/uwsgi.ini
-COPY /searxng/settings.yml /workspace/searxng/settings.yml
-COPY /searxng/limiter.toml /workspace/searxng/limiter.toml
-
-COPY /docker-scripts/entrypoint.sh /workspace/sbin/entrypoint.sh
-COPY /docker-scripts/env-defaults /workspace/env-defaults
-RUN chmod +x /workspace/sbin/entrypoint.sh
-
-EXPOSE 8000
-EXPOSE 3000
+FROM alpine:3.20
+ENTRYPOINT ["/sbin/tini","--","/usr/local/searxng/dockerfiles/docker-entrypoint.sh"]
 EXPOSE 8080
+VOLUME /etc/searxng
 
-ENTRYPOINT ["/workspace/sbin/entrypoint.sh"]# lulala
+ARG SEARXNG_GID=977
+ARG SEARXNG_UID=977
+
+RUN addgroup -g ${SEARXNG_GID} searxng && \
+    adduser -u ${SEARXNG_UID} -D -h /usr/local/searxng -s /bin/sh -G searxng searxng
+
+ENV INSTANCE_NAME=searxng \
+    AUTOCOMPLETE= \
+    BASE_URL= \
+    MORTY_KEY= \
+    MORTY_URL= \
+    SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml \
+    UWSGI_SETTINGS_PATH=/etc/searxng/uwsgi.ini \
+    UWSGI_WORKERS=%k \
+    UWSGI_THREADS=4
+
+WORKDIR /usr/local/searxng
+
+COPY requirements.txt ./requirements.txt
+
+RUN apk add --no-cache -t build-dependencies \
+    build-base \
+    py3-setuptools \
+    python3-dev \
+    libffi-dev \
+    libxslt-dev \
+    libxml2-dev \
+    openssl-dev \
+    tar \
+    git \
+ && apk add --no-cache \
+    ca-certificates \
+    python3 \
+    py3-pip \
+    libxml2 \
+    libxslt \
+    openssl \
+    tini \
+    uwsgi \
+    uwsgi-python3 \
+    brotli \
+ && pip3 install --break-system-packages --no-cache -r requirements.txt \
+ && apk del build-dependencies \
+ && rm -rf /root/.cache
+
+COPY --chown=searxng:searxng dockerfiles ./dockerfiles
+COPY --chown=searxng:searxng searx ./searx
+
+ARG TIMESTAMP_SETTINGS=0
+ARG TIMESTAMP_UWSGI=0
+ARG VERSION_GITCOMMIT=unknown
+
+RUN su searxng -c "/usr/bin/python3 -m compileall -q searx" \
+ && touch -c --date=@${TIMESTAMP_SETTINGS} searx/settings.yml \
+ && touch -c --date=@${TIMESTAMP_UWSGI} dockerfiles/uwsgi.ini \
+ && find /usr/local/searxng/searx/static -a \( -name '*.html' -o -name '*.css' -o -name '*.js' \
+    -o -name '*.svg' -o -name '*.ttf' -o -name '*.eot' \) \
+    -type f -exec gzip -9 -k {} \+ -exec brotli --best {} \+
+
+# Keep these arguments at the end to prevent redundant layer rebuilds
+ARG LABEL_DATE=
+ARG GIT_URL=unknown
+ARG SEARXNG_GIT_VERSION=unknown
+ARG SEARXNG_DOCKER_TAG=unknown
+ARG LABEL_VCS_REF=
+ARG LABEL_VCS_URL=
+LABEL maintainer="searxng <${GIT_URL}>" \
+      description="A privacy-respecting, hackable metasearch engine." \
+      version="${SEARXNG_GIT_VERSION}" \
+      org.label-schema.schema-version="1.0" \
+      org.label-schema.name="searxng" \
+      org.label-schema.version="${SEARXNG_GIT_VERSION}" \
+      org.label-schema.url="${LABEL_VCS_URL}" \
+      org.label-schema.vcs-ref=${LABEL_VCS_REF} \
+      org.label-schema.vcs-url=${LABEL_VCS_URL} \
+      org.label-schema.build-date="${LABEL_DATE}" \
+      org.label-schema.usage="https://github.com/searxng/searxng-docker" \
+      org.opencontainers.image.title="searxng" \
+      org.opencontainers.image.version="${SEARXNG_DOCKER_TAG}" \
+      org.opencontainers.image.url="${LABEL_VCS_URL}" \
+      org.opencontainers.image.revision=${LABEL_VCS_REF} \
+      org.opencontainers.image.source=${LABEL_VCS_URL} \
+      org.opencontainers.image.created="${LABEL_DATE}" \
+      org.opencontainers.image.documentation="https://github.com/searxng/searxng-docker"
